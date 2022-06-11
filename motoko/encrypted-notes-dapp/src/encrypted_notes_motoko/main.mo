@@ -1,523 +1,385 @@
-import Map "mo:base/HashMap";
+// submited news will be checked to canisters >> verified/not, add up all the point of the verifier, recommendation will be based on most credible sources/like
+// news removal protocol
+import Trie "mo:base/Trie";
+import Int "mo:base/Int";
 import Text "mo:base/Text";
+import Principal "mo:base/Principal";
+import Option "mo:base/Option";
+import Iter "mo:base/Iter";
+import Nat "mo:base/Nat";
+import Result "mo:base/Result";
+import Error "mo:base/Error";
+import ICRaw "mo:base/ExperimentalInternetComputer";
+import List "mo:base/List";
+import Time "mo:base/Time";
+import Stack "mo:base/Stack";
+import Types "./Types";
+import RBTree "mo:base/RBTree";
+import Map "mo:base/HashMap";
+import Debug "mo:base/Debug";
 import Array "mo:base/Array";
 import Buffer "mo:base/Buffer";
-import List "mo:base/List";
-import Iter "mo:base/Iter";
-import Time "mo:base/Time";
-import Int "mo:base/Int";
-import Nat "mo:base/Nat";
-import Bool "mo:base/Bool";
-import Principal "mo:base/Principal";
-import Result "mo:base/Result";
-import Option "mo:base/Option";
-import Debug "mo:base/Debug";
-import Order "mo:base/Order";
-
-import En "types";
-import UserStore "user_store";
 
 
-// Declare a shared actor class
-// Bind the caller and the initializer
-shared({ caller = initializer }) actor class() {
 
-    // Currently, a single canister smart contract is limited to 4 GB of storage due to WebAssembly limitations.
-    // To ensure that our canister does not exceed this limit, we restrict memory usage to at most 2 GB because 
-    // up to 2x memory may be needed for data serialization during canister upgrades. Therefore, we aim to support
-    // up to 1,000 users, each storing up to 2 MB of data. 
-    // 1) One half of this data is reserved for device management: 
-    //     DEVICES_PER_USER = (MAX_CYPHERTEXT_LENGTH + MAX_PUBLIC_KEY_LENGTH + MAX_DEVICE_ALIAS_LENGTH) x (4 bytes per char) x MAX_DEVICES_PER_USER
-    //     1 MB = 40,700 x 4 x 6 = 976,800
-    // 2) Another half is reserved for storing the notes:
-    //     NOTES_PER_USER = MAX_NOTES_PER_USER x MAX_NOTE_CHARS x (4 bytes per char)
-    //     1 MB = 500 x 500 x 4 = 1,000,000
+actor {
+    private var notesByUser = Map.HashMap<Text, Buffer.Buffer<Types.Writing>>(400, Text.equal, Text.hash);  
+    private var viewsById = Map.HashMap<Nat, Trie.Trie<Nat, Types.Writing>>(400, Nat.equal, Int.hash);
+    private var balanceByUser = Map.HashMap<Text, Nat>(400, Text.equal, Text.hash); 
+    private var grantToOrg = Map.HashMap<Text, Nat>(10, Text.equal, Text.hash);
+    var organizations : Trie.Trie<Text, DAO> = Trie.empty();
 
-    // Define dapp limits - important for security assurance
-    private let MAX_USERS = 1_000;
-    private let MAX_NOTES_PER_USER = 500;
-    private let MAX_DEVICES_PER_USER = 6;
-    private let MAX_NOTE_CHARS = 500;
-    private let MAX_DEVICE_ALIAS_LENGTH = 200;
-    private let MAX_PUBLIC_KEY_LENGTH = 500;
-    private let MAX_CYPHERTEXT_LENGTH = 40_000;
-
-    // Define private types
+    var reading_fee = 1;
+    stable var writing_id : Nat = 0;
     private type PrincipalName = Text;
 
-    // Define public types
-    // Type of an encrypted note
-    // Attention: This canister does *not* perform any encryption. 
-    //            Here we assume that the notes are encrypted end-
-    //            to-end by the front-end (at client side). 
-    public type EncryptedNote = {
-        encrypted_text: Text;
-        id: Nat;
+    private var weekly_news = RBTree.RBTree<Nat, Types.Writing_identifier>(Nat.compare);
+    private var hall_of_fame : Stack.Stack<(Principal,Nat)> = Stack.Stack();
+
+
+    func organization_get(name : Text) : ?DAO = Trie.get(organizations, Types.organization_key(name), Text.equal);
+    public shared({caller}) func organization_put(name : Text, desc : Text) {
+        let organization : DAO = DAO(caller, name, desc);
+        organizations := Trie.put(organizations, Types.organization_key(name), Text.equal, organization).0;
+        balanceByUser.put(name, 0)
     };
 
-    // Define private fields
-    // Stable actor fields are automatically retained across canister upgrades. 
-    // See https://smartcontracts.org/docs/language-guide/upgrades.html
-
-    // Design choice: Use globally unique note identifiers for all users.
-    //
-    // The keyword `stable` makes this (scalar) variable keep its value across canister upgrades.
-    //
-    // See https://smartcontracts.org/docs/developers-guide/working-with-canisters.html#upgrade-canister
-    private stable var nextNoteId: Nat = 1;
-    
-    // Internal representation: store each user's notes in a separate List. 
-    private var notesByUser = Map.HashMap<PrincipalName, List.List<EncryptedNote>>(0, Text.equal, Text.hash);
-    
-    // While accessing data via [notesByUser] is more efficient, we use the following stable array
-    // as a buffer to preserve user notes across canister upgrades.
-    // See also: [preupgrade], [postupgrade]
-    private stable var stable_notesByUser: [(PrincipalName, List.List<EncryptedNote>)] = [];
-
-    // Internal representation: associate each user with a UserStore
-    private var users = Map.HashMap<Principal, UserStore.UserStore>(10, Principal.equal, Principal.hash);
-
-    // While accessing data via hashed structures (e.g., [users]) may be more efficient, we use 
-    // the following stable array as a buffer to preserve registered users and user devices across 
-    // canister upgrades. 
-    // See also: [pre_upgrade], [post_upgrade]
-    // TODO: replace with
-    // private stable var stable_users: [UserStore.StableUserStoreEntry] = [];
-    // once https://github.com/dfinity/motoko/issues/3128 is resolved.
-    private stable var stable_users: [(Principal, En.PublicKey, En.DeviceAlias, ?En.Ciphertext)] = [];
-
-    // The following invariant is preserved by [register_device].
-    //
-    // All the functions of this canister's public API are available only to 
-    // registered users, with the exception of [register_device] and [whoami].
-    //
-    // See also: [is_user_registered]
-    private func users_invariant(): Bool {
-        notesByUser.size() == users.size()
+    public func get_writing_id() : async Nat {
+        writing_id+= 1;
+        return writing_id;
     };
 
-    // Check if this user has been registered 
-    // Note: [register_device] must be each user's very first update call.
-    // See also: [users_invariant]
-    private func is_user_registered(principal: Principal): Bool {
-        Option.isSome(users.get(principal));
-    };
-
-    // Returns the current number of users.
-    // Traps if [users_invariant] is violated
-    private func user_count(): Nat {
-        assert users_invariant();
-        notesByUser.size()
-    };
-
-    // Check that a note identifier is sane. This is needed since Motoko integers 
-    // are infinite-precision. 
-    // Note: avoid extraneous usage of async functions, hence [user_count]
-    private func is_id_sane(id: Int): Bool {
-        0 <= id and id < MAX_NOTES_PER_USER * user_count()
-    };
-
-    // Returns `true` iff [store.device_list] contains the provided public key [pk].
-    //
-    // Traps:
-    //      [store.device_list] exceeds [MAX_DEVICES_PER_USER]
-    //      [pk] exceeds [MAX_PUBLIC_KEY_LENGTH]
-    private func is_known_public_key(store: UserStore.UserStore, pk: En.PublicKey): Bool {
-        assert store.device_list.size() <= MAX_DEVICES_PER_USER;
-        assert pk.size() <= MAX_PUBLIC_KEY_LENGTH;
-
-        var found = false;
-        for (x in store.device_list.entries()) {
-            if (x.1 == pk) {
-                return true;
+    //check the news or etc
+    public shared({caller}) func upload_writing(index : Nat) : async Types.Result<(), Text> {
+        var score : Nat = 0;
+        let writings : [Types.Writing] = await get_notes();
+        let file = writings.get(index);
+        let array = file.verifier;
+        for (org in array.vals()) {
+            let group = organization_get(org);
+            switch(group) {
+                case null {score += 0};
+                case (?group) {score += group.size}
+                }
+            };
+        switch(?score) {
+            case(null) {#err "Failed verification"};
+            case(?Nat) {
+                let identifier : Types.Writing_identifier = {
+                    id_num = index; 
+                    writer = caller; 
+                };
+                weekly_news.put(score, identifier);
+                #ok
+                    }
             }
-        };
-        false
     };
 
-    // Utility function that helps writing assertion-driven code more concisely.
-    private func expect<T>(opt: ?T, violation_msg: Text): T {
-        switch (opt) {
-            case (null) {
-                Debug.trap(violation_msg);
+
+    // transfer token
+    public shared ({ caller }) func transfer(target : Text, amount : Nat) : async Types.Result<(), Text> {
+        let from = Principal.toText(caller);
+        var balanceto : Nat = 0;
+        var balancefrom : Nat = 0;
+        switch (balanceByUser.get(from)){
+            case null { #err "user does not exist"};
+            case (?balance) {
+                if (balance > amount){
+                    let balanceto = Option.get(balanceByUser.get(target),0) + amount;
+                    let balancefrom = balance - amount;
+                }
+                else {return #err "insufficient balance"};
+                balanceByUser.put(target, balanceto);
+                balanceByUser.put(from, balancefrom);
+                #ok
+            }
+        }
+    };
+
+    public shared ({caller}) func open_news(writer : Principal, index : Nat) : async Types.Writing {
+        let principalName = Principal.toText(writer);
+        let userNotes : Buffer.Buffer<Types.Writing> = Option.get(notesByUser.get(principalName), Buffer.Buffer<Types.Writing>(0));
+        let writing : Types.Writing = userNotes.get(index); 
+
+        assert (writing.state == #free);
+        let to = Principal.toText(writer);
+        assert Result.isOk(await transfer(to, reading_fee));
+        assert Result.isOk(await transfer("owner_principal", reading_fee/20));
+
+        return writing;
+        };
+
+
+    
+
+    /// organization
+    ////////////////
+    ////////////////
+    class DAO(founder : Principal, name : Text, description : Text) = Self {
+        public var id = name;
+        public var desc = description;
+        public var size : Nat = 1;    
+        public var vote_reward : Nat = 1;
+        public var fees : Trie.Trie<Text, Nat> = Trie.empty();
+        public var thresholds = Types.threshold_fromArray(["join request", "verify news"]);
+        public var comments = Map.HashMap<Nat, Buffer.Buffer<Types.Comment>>(10, Nat.equal, Int.hash);
+        public var accounts : Trie.Trie<Principal, Nat> = Trie.empty();
+
+        public var proposals : Trie.Trie<Nat, Types.Proposal> = Trie.empty();
+        public var total_token : Nat = 0;
+        public var questions : List.List<Types.Question> = List.nil();
+
+        public func account_get(id : Principal) : ?Nat = Trie.get(accounts, Types.account_key(id), Principal.equal);
+        public func account_put(id : Principal, tokens : Nat) {
+        accounts := Trie.put(accounts, Types.account_key(id), Principal.equal, tokens).0;
+        };
+        account_put(founder, 1);
+        
+        public func proposal_get(id : Nat) : ?Types.Proposal = Trie.get(proposals, Types.proposal_key(id), Nat.equal);
+        public func proposal_put(id : Nat, proposal : Types.Proposal) {
+            proposals := Trie.put(proposals, Types.proposal_key(id), Nat.equal, proposal).0;
+        }; 
+        public func fees_get(inst :Text) : ?Nat =  Trie.get(fees, Types.fees_key(inst), Text.equal);
+        public func fees_put(inst : Text, value :Nat) {
+            fees := Trie.put(fees, Types.fees_key(inst), Text.equal, value).0;
+        };
+        public func threshold_get(inst :Text) : ?Nat=  Trie.get(thresholds, Types.threshold_key(inst), Text.equal);
+        public func threshold_put(inst : Text, value : Nat) {
+            thresholds := Trie.put(thresholds, Types.threshold_key(inst), Text.equal, value).0;
             };
-            case (?x) {
-                x
+
+        /// Reward for voting
+        public func reward(amount : Nat, caller : Principal) {
+            switch (account_get(caller)) {
+                case null {};
+                case (?balance) {
+                    let to_amount = balance + vote_reward;
+                    account_put(caller, to_amount);
+                    total_token += vote_reward;
+                };
+            };
+        };
+
+    };
+
+        /// Submit a proposalto and organization
+    public shared({caller}) func submit_proposal(title : Text, desc: Text, tag : Text, income : Nat, org : Text, order : Nat) : async Types.Result<Nat, Text> {
+        let rando : Principal = caller;
+        let empty_DAO : DAO = DAO(rando, "", "");
+        let organization = Option.get(organization_get(org), empty_DAO);
+        let proposal_id = Types.proposal_key(writing_id);
+        
+
+        let proposal : Types.Proposal = {
+            id = writing_id;
+            ord = order;
+            title = title;
+            tag = tag;
+            votes_no = 0;
+            votes_yes = 0;
+            voters = List.nil();
+            state = #open;
+            proposer = caller;
+            payload = desc;
+            threshold = organization.threshold_get(tag);
+            comments = Buffer.Buffer<Types.Comment>(1);
+        };
+        organization.proposal_put(writing_id, proposal);
+        writing_id += 1;
+        #ok(writing_id)
+    };
+
+    public shared ({caller}) func submit_question(content : Text, title : Text, org : Text){
+        let rando : Principal = caller;
+        let empty_DAO : DAO = DAO(rando, "", "");
+        let organization = Option.get(organization_get(org), empty_DAO);
+        let principalName = Principal.toText(caller);
+        let question : Types.Question = {
+            title;
+            content; 
+            proposer = caller;
+        };
+        let writing = List.make(question); 
+        organization.questions := List.append(organization.questions, writing);
+    };
+
+    /// Return the list of all proposals
+    public query({caller}) func list_proposals(org : Text) : async [Types.Proposal] {
+        let rando : Principal = caller;
+        let empty_DAO : DAO = DAO(rando, "", "");
+        let organization = Option.get(organization_get(org), empty_DAO);
+        Iter.toArray(Iter.map(Trie.iter(organization.proposals), func (kv : (Nat, Types.Proposal)) : Types.Proposal = kv.1))
+    };
+
+    // Vote on an open proposal
+    public shared({caller}) func vote(proposal_id : Nat, vote : Types.Vote, org : Text) : async Types.Result<Types.ProposalState, Text> {
+        let rando : Principal = caller;
+        let empty_DAO : DAO = DAO(rando, "", "");
+        let organization = Option.get(organization_get(org), empty_DAO);
+        switch (organization.proposal_get(proposal_id)) {
+        case null { #err("No proposal with ID " # debug_show(proposal_id) # " exists") };
+        case (?proposal) {
+                var count = 1;
+                var state = proposal.state;
+                if (state != #open) {
+                    return #err("Proposal " # debug_show(proposal_id) # " is not open for voting");
+                };
+                switch (organization.account_get(caller)) {
+                case null { return #err("Caller is not a member") };
+                case (?amount_e8s) {
+                        if (List.some(proposal.voters, func (e : Principal) : Bool = e == caller)) {
+                            return #err("Already voted");
+                        };
+                        var votes_yes = proposal.votes_yes;
+                        var votes_no = proposal.votes_no;
+                        // check if owner
+                        switch (vote) {
+                            case (#yes) { votes_yes += count };
+                            case (#no) { votes_no += count };
+                            //reward for voting
+                        };
+                        organization.reward(organization.vote_reward, caller);
+                        let voters = List.push(caller, proposal.voters);
+                            /// deal with result
+                        if (votes_no >= Option.get(proposal.threshold,0)) {
+                            state := #rejected;
+                        };
+                        if (votes_yes >= Option.get(proposal.threshold,0)) {
+                            state := #accepted;
+                            if (Text.equal(proposal.tag, "verify news")){
+                                let writer = Option.get(notesByUser.get(Principal.toText(proposal.proposer)), Buffer.Buffer<Types.Writing>(1));
+                                let writing : Types.Writing = writer.get(proposal.ord);
+                                let updated_writing : Types.Writing = {
+                                    id = writing.id; 
+                                    title = writing.title;
+                                    content = writing.content; 
+                                    verifier = Array.append(writing.verifier, [org]);
+                                    state = writing.state;
+                                    likes = writing.likes;
+                                    views = 0;
+                                };
+                                writer.put(proposal.ord, updated_writing);
+                            };
+                            if (Text.equal(proposal.tag, "join request")){
+                                organization.account_put(proposal.proposer, 1)
+                            } 
+                            
+                        };
+
+                        let updated_proposal = {
+                            id = proposal.id;
+                            ord = proposal.ord;
+                            votes_yes = votes_yes;   
+                            title = proposal.title;                           
+                            votes_no = votes_no;
+                            voters = proposal.voters;
+                            state = state;
+                            tag = proposal.tag;
+                            threshold = proposal.threshold;
+                            proposer = proposal.proposer;
+                            payload = proposal.payload;
+                        };
+                        organization.proposal_put(proposal_id, updated_proposal);
+                    };
+                };
+                #ok(state)
             };
         };
     };
+    // add comment to requests
+    public shared ({caller}) func can_comment(proposal_id : Nat, org : Text) : async Types.Result<(), Text>{
+        let rando : Principal = caller;
+        let empty_DAO : DAO = DAO(rando, "", "");
+        let organization = Option.get(organization_get(org), empty_DAO);
+        switch(organization.proposal_get(proposal_id)) {
+            case null {#err "no"};
+            case (?proposal) {
+                switch(organization.account_get(caller)){
+                    case(null) {
+                        if(Principal.equal(caller, proposal.proposer)) return #ok;
+                        #err "not qualified";
+                    };
+                    case(?Tokens) {
+                        return #ok
+                    }
+                }
+            }
+        }
+    };
 
-    // Reflects the [caller]'s identity by returning (a future of) its principal. 
-    // Useful for debugging. 
+
+
+    //list all the feeds
+    public query({caller}) func list_comments(proposal_id : Nat, org : Text): async [Types.Comment] {
+        let rando : Principal = caller;
+        let empty_DAO : DAO = DAO(rando, "", "");
+        let organization = Option.get(organization_get(org), empty_DAO);
+        let prop = organization.comments.get(proposal_id);
+        switch (prop) {
+            case null {return []};
+            case (?prop) {
+                return prop.toArray();
+            }
+        }
+    };
+
+
+
+    /// users
+
+    
+    //check if account exist
+   private func is_user_registered(principal: Principal): Bool {
+        Option.isSome(notesByUser.get(Principal.toText(principal)));
+    };
+    
+    // return identity 
     public shared({ caller }) func whoami(): async Text {
         return Principal.toText(caller);
     };
-
-    // Shared functions, i.e., those specified with [shared], are 
-    // accessible to remote callers. 
-    // The extra parameter [caller] is the caller's principal
-    // See https://smartcontracts.org/docs/language-guide/actors-async.html
-
-    // Add new note for this [caller]. Note: this function may be called only by 
-    // those users that have at least one device registered via [register_device].
-    //      [encrypted_text]: (encrypted) content of this note
-    //
-    // Returns: 
-    //      Future of unit
-    // Traps: 
-    //      [caller] is the anonymous identity
-    //      [caller] is not a registered user
-    //      [encrypted_text] exceeds [MAX_NOTE_CHARS]
-    //      User already has [MAX_NOTES_PER_USER] notes
-    public shared({ caller }) func add_note(encrypted_text: Text): async () {
+    
+    // add writings
+    public shared({ caller }) func add_note(title : Text, writing : Text): async () {
         assert not Principal.isAnonymous(caller);
         assert is_user_registered(caller);
-        assert encrypted_text.size() <= MAX_NOTE_CHARS;
 
         Debug.print("Adding note...");
 
         let principalName = Principal.toText(caller);
-        let userNotes : List.List<EncryptedNote> = Option.get(notesByUser.get(principalName), List.nil<EncryptedNote>());
-
-        // check that user is not going to exceed limits
-        assert List.size(userNotes) < MAX_NOTES_PER_USER;
-        
-        let newNote: EncryptedNote = {
-            id = nextNoteId; 
-            encrypted_text = encrypted_text
-        };
-        nextNoteId += 1;
-        notesByUser.put(principalName, List.push(newNote, userNotes));
-    };
-
-    // Returns (a future of) this [caller]'s notes.
-    // 
-    // --- Queries vs. Updates ---
-    // Note that this method is declared as an *update* call (see `shared`) rather than *query*.
-    //
-    // While queries are significantly faster than updates, they are not certified by the IC. 
-    // Thus, we avoid using queries throughout this dapp, ensuring that the result of our 
-    // functions gets through consensus. Otherwise, this function could e.g. omit some notes 
-    // if it got executed by a malicious node. (To make the dapp more efficient, one could 
-    // use an approach in which both queries and updates are combined.)
-    // See https://smartcontracts.org/docs/developers-guide/concepts/canisters-code.html#query-update
-    //
-    // Returns: 
-    //      Future of array of EncryptedNote
-    // Traps: 
-    //      [caller] is the anonymous identity
-    //      [caller] is not a registered user
-    public shared({ caller }) func get_notes(): async [EncryptedNote] {
-        assert not Principal.isAnonymous(caller);
-        assert is_user_registered(caller);
-
-        let principalName = Principal.toText(caller);
-        let userNotes = Option.get(notesByUser.get(principalName), List.nil());
-        return List.toArray(userNotes);
-    };
-
-    // Update this [caller]'s note (by replacing an existing with 
-    // the same id). If none of the existing notes have this id, 
-    // do nothing. 
-    // [encrypted_note]: the note to be updated
-    //
-    // Returns: 
-    //      Future of unit
-    // Traps: 
-    //      [caller] is the anonymous identity
-    //      [caller] is not a registered user
-    //      [encrypted_note.encrypted_text] exceeds [MAX_NOTE_CHARS]
-    //      [encrypted_note.id] is unreasonable; see [is_id_sane]
-    public shared({ caller }) func update_note(encrypted_note: EncryptedNote): async () {
-        assert not Principal.isAnonymous(caller);
-        assert is_user_registered(caller);
-        assert encrypted_note.encrypted_text.size() <= MAX_NOTE_CHARS;
-        assert is_id_sane(encrypted_note.id);
-
-        let principalName = Principal.toText(caller);
-        var existingNotes = expect(notesByUser.get(principalName), 
-            "registered user (principal " # principalName # ") w/o allocated notes");
-
-        var updatedNotes = List.map(existingNotes, func (note: EncryptedNote): EncryptedNote {
-            if (note.id == encrypted_note.id) {
-                encrypted_note
-            } else {
-                note
-            }
-        });
-        notesByUser.put(principalName, updatedNotes);
-    };
-
-    // Delete this [caller]'s note with given id. If none of the 
-    // existing notes have this id, do nothing. 
-    // [id]: the id of the note to be deleted
-    //
-    // Returns: 
-    //      Future of unit
-    // Traps: 
-    //      [caller] is the anonymous identity
-    //      [caller] is not a registered user
-    //      [id] is unreasonable; see [is_id_sane]
-    public shared({ caller }) func delete_note(id: Int): async () {
-        assert not Principal.isAnonymous(caller);
-        assert is_user_registered(caller);
-        assert is_id_sane(id);
-
-        let principalName = Principal.toText(caller);
-        var notesOfUser = Option.get(notesByUser.get(principalName), List.nil());
-
-        notesByUser.put(
-            principalName,
-            List.filter(notesOfUser, func(note: EncryptedNote): Bool { note.id != id })
-        )
-    };
-
-    // Below, we implement a decentralized key-value store. 
-    // The purpose of this code is to support and synchronize 
-    // multiple devices that a single user may have. 
-
-    // Associate a public key with a device ID.
-    // Returns: 
-    //      `true` iff device is *newly* registered, ie. [alias] has not been 
-    //      registered for this user before. 
-    // Traps:
-    //      [caller] is the anonymous identity
-    //      [alias] exceeds [MAX_DEVICE_ALIAS_LENGTH]
-    //      [pk] exceeds [MAX_PUBLIC_KEY_LENGTH]
-    //      While registering new user's device:
-    //          There are already [MAX_USERS] users while we need to register a new user
-    //          This user already has notes despite not having any registered devices
-    //      This user already has [MAX_DEVICES_PER_USER] registered devices.
-    public shared({ caller }) func register_device(
-        alias: En.DeviceAlias, pk: En.PublicKey
-    ): async Bool {
-        
-        assert not Principal.isAnonymous(caller);
-        assert alias.size() <= MAX_DEVICE_ALIAS_LENGTH;
-        assert pk.size() <= MAX_PUBLIC_KEY_LENGTH;
-
-        // get caller's device list and add
-        switch (users.get(caller)) {
-            case null {
-                // caller unknown ==> check invariants
-                // A. can we add a new user?
-                assert user_count() < MAX_USERS;
-                // B. this caller does not have notes
-                let principalName = Principal.toText(caller);
-                assert notesByUser.get(principalName) == null;
-
-                // ... then initialize the following:
-                // 1) a new [UserStore] instance in [users]
-                let new_store = UserStore.UserStore(caller, 10);
-                new_store.device_list.put(alias, pk);
-                users.put(caller, new_store);
-                // 2) a new [[EncryptedNote]] list in [notesByUser]
-                notesByUser.put(principalName, List.nil());
-                
-                // finally, indicate accept
-                true
+        let newNote : Types.Writing = {
+            id = writing_id; 
+            title;
+            content = writing; 
+            verifier = []; 
+            state = #for_self; 
+            views = 0; 
+            likes = 0;
             };
-            case (?store) {
-                if (Option.isSome(store.device_list.get(alias))) {
-                    // device alias already registered ==> indicate reject
-                    false
-                } else {
-                    // device not yet registered ==> check that user did not exceed limits
-                    assert store.device_list.size() < MAX_DEVICES_PER_USER;
-                    // all good ==> register device
-                    store.device_list.put(alias, pk);
-                    // indicate accept
-                    true
-                }
-            };
-        }
+        writing_id += 1;
+        let userNotes : Buffer.Buffer<Types.Writing> = Option.get(notesByUser.get(principalName), Buffer.Buffer<Types.Writing>(1));
+        userNotes.add(newNote);
+
+        notesByUser.put(principalName, userNotes);
+        writing_id += 1;
     };
 
-    // Remove this user's device with given [alias]
-    //
-    // Traps: 
-    //      [caller] is the anonymous identity
-    //      [caller] is not a registered user
-    //      [alias] exceeds [MAX_DEVICE_ALIAS_LENGTH]
-    //      [caller] has only one registered device (which we refuse to remove)
-    public shared({ caller }) func remove_device(alias: En.DeviceAlias): () {
-        assert not Principal.isAnonymous(caller);
-        assert is_user_registered(caller);
-        assert alias.size() <= MAX_DEVICE_ALIAS_LENGTH;
-
-        let store = expect(users.get(caller), 
-            "registered user (principal " # Principal.toText(caller) # ") w/o allocated notes");
-
-        assert store.device_list.size() > 1;
-
-        Option.iterate(store.device_list.get(alias), func (k: En.PublicKey) {
-            store.ciphertext_list.delete(k);
-        });
-        store.device_list.delete(alias);
-    };
-
-    // Returns:
-    //      Future array of all (device, public key) pairs for this user's registered devices.
-    //
-    //      See also [get_notes], in particular, "Queries vs. Updates"
-    // Traps: 
-    //      [caller] is the anonymous identity
-    //      [caller] is not a registered user
-    public shared({ caller }) func get_devices(): async [(En.DeviceAlias, En.PublicKey)] {
+    //get writings to be uploaded to news feed
+    public shared({ caller }) func get_notes(): async [Types.Writing] {
         assert not Principal.isAnonymous(caller);
         assert is_user_registered(caller);
 
-        let store = switch (users.get(caller)) {
-            case (?s) { s };
-            case null { return [] }
+        let principalName = Principal.toText(caller);
+        let userNotes = Option.get(notesByUser.get(principalName), Buffer.Buffer<Types.Writing>(1));
+        return userNotes.toArray();
+    };
+
+    public func get_news(): async[Types.Writing_identifier] {
+        let list = RBTree.iter(weekly_news.share(), #bwd);
+        var result : List.List<Types.Writing_identifier> = List.nil();
+        for ((key,writing) in list) {
+            let new = List.make(writing);
+            result := List.append(result, new);
         };
-        Iter.toArray(store.device_list.entries())
-    };
-
-    // Returns:
-    //      Future array of all public keys that are not already associated with a device.
-    //
-    //      See also [get_notes], in particular, "Queries vs. Updates"
-    // Traps: 
-    //      [caller] is the anonymous identity
-    //      [caller] is not a registered user
-    public shared({ caller }) func get_unsynced_pubkeys(): async [En.PublicKey] {
-        assert not Principal.isAnonymous(caller);
-        assert is_user_registered(caller);
-
-        let store = switch (users.get(caller)) {
-            case (?s) { s };
-            case null { return [] }
-        };
-        let entries = Iter.toArray(store.device_list.entries());
-
-        Array.mapFilter(entries, func((alias, key): (En.DeviceAlias, En.PublicKey)): ?En.PublicKey {
-            if (Option.isNull(store.ciphertext_list.get(key))) {
-                ?key
-            } else {
-                null
-            }
-        })
-    };
-
-    // Returns: 
-    //      `true` iff the user has at least one public key.
-    //
-    //      See also [get_notes], in particular, "Queries vs. Updates"
-    // Traps: 
-    //      [caller] is the anonymous identity
-    //      [caller] is not a registered user
-    public shared({ caller }) func is_seeded(): async Bool {
-        assert not Principal.isAnonymous(caller);
-        assert is_user_registered(caller);
-
-        switch (users.get(caller)) {
-            case null { false };
-            case (?store) { store.ciphertext_list.size() > 0 }
-        }
-    };
-
-    // Fetch the private key associated with this public key.
-    // See also [get_notes], in particular, "Queries vs. Updates"
-    // Returns:
-    //      Future of an [En.Ciphertext] result
-    // Traps: 
-    //      [caller] is the anonymous identity
-    //      [caller] is not a registered user
-    //      [pk] exceeds [MAX_PUBLIC_KEY_LENGTH]
-    public shared({ caller }) func get_ciphertext(
-        pk: En.PublicKey
-    ): async Result.Result<En.Ciphertext, En.GetCiphertextError> {
-        
-        assert not Principal.isAnonymous(caller);
-        assert is_user_registered(caller);        
-        assert pk.size() <= MAX_PUBLIC_KEY_LENGTH;
-                
-        let store = switch (users.get(caller)) {
-            case null { return #err(#notFound) };
-            case (?s) { s }
-        };
-        if (not is_known_public_key(store, pk)) {
-            return #err(#notFound) // pk unknown
-        };
-        switch (store.ciphertext_list.get(pk)) {
-            case null { #err(#notSynced) };
-            case (?ciphertext) { #ok(ciphertext) }
-        };
-    };
-
-    // Store a list of public keys and associated private keys. 
-    // Considers only public keys matching those of a registered device.
-    // Does not overwrite key-value pairs that already exist.
-    //
-    // Traps: 
-    //      [caller] is the anonymous identity
-    //      [caller] is not a registered user
-    //      Length of [ciphertexts] exceeds [MAX_DEVICES_PER_USER]
-    //      User is trying to save a known device's ciphertext exceeding [MAX_CYPHERTEXT_LENGTH]
-    public shared({ caller }) func submit_ciphertexts(ciphertexts: [(En.PublicKey, En.Ciphertext)]): () {
-        assert not Principal.isAnonymous(caller);
-        assert is_user_registered(caller);
-        assert ciphertexts.size() <= MAX_DEVICES_PER_USER;
-        
-        let store = switch (users.get(caller)) {
-            case null { return };
-            case (?s) { s }
-        };
-        for ((pk, text) in ciphertexts.vals()) {
-            if (is_known_public_key(store, pk) 
-                and Option.isNull(store.ciphertext_list.get(pk))) {
-
-                assert text.size() <= MAX_CYPHERTEXT_LENGTH;
-                store.ciphertext_list.put(pk, text);
-            }
-        }
-    };
-
-    // Store a public key and associated private key in an empty user store. 
-    // This function is a no-op if the user already has at least one public key stored.
-    //
-    // Traps: 
-    //      [caller] is the anonymous identity
-    //      [caller] is not a registered user
-    //      [pk] exceeds [MAX_PUBLIC_KEY_LENGTH]
-    //      [ctext] exceeding [MAX_CYPHERTEXT_LENGTH]
-    public shared({ caller }) func seed(pk: En.PublicKey, ctext: En.Ciphertext): () {
-        assert not Principal.isAnonymous(caller);
-        assert is_user_registered(caller);
-        assert pk.size() <= MAX_PUBLIC_KEY_LENGTH;
-        assert ctext.size() <= MAX_CYPHERTEXT_LENGTH;
-
-        let store = switch (users.get(caller)) {
-            case null { return };
-            case (?s) { s }
-        };
-        if (is_known_public_key(store, pk) and store.ciphertext_list.size() == 0) {
-            store.ciphertext_list.put(pk, ctext)
-        }
-    };
-
-    // Below, we implement the upgrade hooks for our canister.
-    // See https://smartcontracts.org/docs/language-guide/upgrades.html
-
-    // The work required before a canister upgrade begins.
-    // See [nextNoteId], [stable_notesByUser], [stable_users]
-    system func preupgrade() {
-        Debug.print("Starting pre-upgrade hook...");
-        stable_notesByUser := Iter.toArray(notesByUser.entries());
-        stable_users := UserStore.serializeAll(users);
-        Debug.print("pre-upgrade finished.");
-    };
-
-    // The work required after a canister upgrade ends.
-    // See [nextNoteId], [stable_notesByUser], [stable_users]
-    system func postupgrade() {
-        Debug.print("Starting post-upgrade hook...");
-        notesByUser := Map.fromIter<PrincipalName, List.List<EncryptedNote>>(
-            stable_notesByUser.vals(), stable_notesByUser.size(), Text.equal, Text.hash);
-
-        users := UserStore.deserialize(stable_users, stable_notesByUser.size());
-        stable_notesByUser := [];
-        Debug.print("post-upgrade finished.");
-    };
-};
+        return List.toArray(result);
+    }
+}
